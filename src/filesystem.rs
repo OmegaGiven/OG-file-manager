@@ -181,17 +181,17 @@ pub fn open_default(path: &Path) {
 
 pub fn open_with(path: &Path, exec: &str) {
     let path_str = path.to_string_lossy();
-    let cmd = exec
-        .replace("%f", &path_str)
-        .replace("%F", &path_str)
-        .replace("%u", &path_str)
-        .replace("%U", &path_str);
-
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let parts: Vec<String> = exec
+        .split_whitespace()
+        .map(|tok| match tok {
+            "%f" | "%F" | "%u" | "%U" => path_str.to_string(),
+            other => other.to_string(),
+        })
+        .collect();
     if parts.is_empty() {
         return;
     }
-    let _ = std::process::Command::new(parts[0])
+    let _ = std::process::Command::new(&parts[0])
         .args(&parts[1..])
         .spawn();
 }
@@ -362,7 +362,7 @@ fn theme_hex_colors() -> (String, String, String, String) {
 }
 
 fn theme_cache_dir() -> PathBuf {
-    home_dir().join(".cache/file-manager")
+    home_dir().join(".cache/og-files")
 }
 
 /// Writes (or refreshes, in case the theme changed) a small Alacritty TOML
@@ -547,7 +547,7 @@ pub fn list_drives() -> (Vec<DriveInfo>, Vec<DriveInfo>) {
 // ── Recent places ────────────────────────────────────────────────────────────────
 
 fn recent_file() -> PathBuf {
-    home_dir().join(".config/file-manager/recent.json")
+    home_dir().join(".config/og-files/recent.json")
 }
 
 pub fn load_recent() -> Vec<PathBuf> {
@@ -889,7 +889,7 @@ pub fn compress_paths_zip(paths: &[PathBuf], dest_dir: &Path) -> Result<(), Stri
 }
 
 fn bookmarks_file() -> PathBuf {
-    home_dir().join(".config/file-manager/bookmarks.json")
+    home_dir().join(".config/og-files/bookmarks.json")
 }
 
 pub fn load_bookmarks() -> Vec<PathBuf> {
@@ -919,7 +919,7 @@ pub fn is_video(mime_type: &str) -> bool {
 }
 
 fn preview_cache_dir() -> PathBuf {
-    home_dir().join(".cache/file-manager/previews")
+    home_dir().join(".cache/og-files/previews")
 }
 
 /// Cache key includes mtime+size so an edited/replaced file gets a fresh

@@ -30,10 +30,11 @@ pub fn view<'a>(
     sort_by: &SortBy,
     sort_asc: bool,
     suppress_hover: bool,
+    drop_hover: Option<&'a PathBuf>,
 ) -> Element<'a, Message> {
     let content: Element<Message> = match view_mode {
-        ViewMode::Grid => grid_view(entries, selected, available_width, suppress_hover),
-        ViewMode::List => list_view(entries, selected, sort_by, sort_asc, suppress_hover),
+        ViewMode::Grid => grid_view(entries, selected, available_width, suppress_hover, drop_hover),
+        ViewMode::List => list_view(entries, selected, sort_by, sort_asc, suppress_hover, drop_hover),
     };
 
     let area = mouse_area(
@@ -57,7 +58,13 @@ const CARD_WIDTH: f32 = 110.0;
 const CARD_SPACING: f32 = 8.0;
 const GRID_PADDING: f32 = 24.0; // matches the 12px padding on both sides in view()
 
-fn grid_view<'a>(entries: &'a [FileEntry], selected: &'a HashSet<PathBuf>, available_width: f32, suppress_hover: bool) -> Element<'a, Message> {
+fn grid_view<'a>(
+    entries: &'a [FileEntry],
+    selected: &'a HashSet<PathBuf>,
+    available_width: f32,
+    suppress_hover: bool,
+    drop_hover: Option<&'a PathBuf>,
+) -> Element<'a, Message> {
     if entries.is_empty() {
         return container(
             text("Empty folder").style(move |_| text::Style { color: Some(MUTED()) })
@@ -75,7 +82,8 @@ fn grid_view<'a>(entries: &'a [FileEntry], selected: &'a HashSet<PathBuf>, avail
     while let Some(chunk) = chunks.next() {
         let mut row_items = row![].spacing(8);
         for entry in chunk {
-            row_items = row_items.push(grid_card(entry, selected.contains(&entry.path), suppress_hover));
+            let is_drop_target = entry.is_dir && drop_hover == Some(&entry.path);
+            row_items = row_items.push(grid_card(entry, selected.contains(&entry.path), suppress_hover, is_drop_target));
         }
         rows.push(row_items.into());
     }
@@ -83,17 +91,20 @@ fn grid_view<'a>(entries: &'a [FileEntry], selected: &'a HashSet<PathBuf>, avail
     column(rows).spacing(8).into()
 }
 
-fn grid_card<'a>(entry: &'a FileEntry, selected: bool, suppress_hover: bool) -> Element<'a, Message> {
+fn grid_card<'a>(entry: &'a FileEntry, selected: bool, suppress_hover: bool, is_drop_target: bool) -> Element<'a, Message> {
     let path = entry.path.clone();
     let path2 = entry.path.clone();
+    let path3 = entry.path.clone();
+    let path4 = entry.path.clone();
+    let path5 = entry.path.clone();
     let name = if entry.name.len() > 14 {
         format!("{}…", &entry.name[..13])
     } else {
         entry.name.clone()
     };
 
-    let border_color = if selected { ACCENT() } else { Color { r: 0.25, g: 0.22, b: 0.32, a: 1.0 } };
-    let bg = if selected { SELECTED_BG() } else { SURFACE() };
+    let border_color = if is_drop_target { ACCENT() } else if selected { ACCENT() } else { Color { r: 0.25, g: 0.22, b: 0.32, a: 1.0 } };
+    let bg = if is_drop_target { SELECTED_BG() } else if selected { SELECTED_BG() } else { SURFACE() };
 
     let btn = button(
         column![
@@ -104,7 +115,6 @@ fn grid_card<'a>(entry: &'a FileEntry, selected: bool, suppress_hover: bool) -> 
         .align_x(iced::Alignment::Center)
         .width(Length::Fill)
     )
-    .on_press(Message::EntryClicked(path))
     .width(110)
     .height(90)
     .style(move |_, status| button::Style {
@@ -113,11 +123,17 @@ fn grid_card<'a>(entry: &'a FileEntry, selected: bool, suppress_hover: bool) -> 
             _ => bg,
         })),
         text_color: TEXT(),
-        border: Border { color: border_color, width: if selected { 2.0 } else { 1.0 }, radius: 6.0.into() },
+        border: Border { color: border_color, width: if is_drop_target { 2.0 } else if selected { 2.0 } else { 1.0 }, radius: 6.0.into() },
         ..Default::default()
     });
 
-    mouse_area(btn).on_right_press(Message::ContextMenuOpenEntry(path2)).into()
+    mouse_area(btn)
+        .on_press(Message::EntryPressed(path))
+        .on_release(Message::EntryReleased(path4))
+        .on_enter(Message::EntryHoverEnter(path3))
+        .on_exit(Message::EntryHoverExit(path5))
+        .on_right_press(Message::ContextMenuOpenEntry(path2))
+        .into()
 }
 
 fn sort_header_btn<'a>(label: &'a str, by: SortBy, width: Length, sort_by: &SortBy, sort_asc: bool) -> Element<'a, Message> {
@@ -146,7 +162,14 @@ fn sort_header_btn<'a>(label: &'a str, by: SortBy, width: Length, sort_by: &Sort
     .into()
 }
 
-fn list_view<'a>(entries: &'a [FileEntry], selected: &'a HashSet<PathBuf>, sort_by: &SortBy, sort_asc: bool, suppress_hover: bool) -> Element<'a, Message> {
+fn list_view<'a>(
+    entries: &'a [FileEntry],
+    selected: &'a HashSet<PathBuf>,
+    sort_by: &SortBy,
+    sort_asc: bool,
+    suppress_hover: bool,
+    drop_hover: Option<&'a PathBuf>,
+) -> Element<'a, Message> {
     let header = row![
         text("").width(30),
         sort_header_btn("Name", SortBy::Name, Length::Fill, sort_by, sort_asc),
@@ -168,16 +191,20 @@ fn list_view<'a>(entries: &'a [FileEntry], selected: &'a HashSet<PathBuf>, sort_
     }
 
     for entry in entries {
-        col = col.push(list_row(entry, selected.contains(&entry.path), suppress_hover));
+        let is_drop_target = entry.is_dir && drop_hover == Some(&entry.path);
+        col = col.push(list_row(entry, selected.contains(&entry.path), suppress_hover, is_drop_target));
     }
 
     col.into()
 }
 
-fn list_row<'a>(entry: &'a FileEntry, selected: bool, suppress_hover: bool) -> Element<'a, Message> {
+fn list_row<'a>(entry: &'a FileEntry, selected: bool, suppress_hover: bool, is_drop_target: bool) -> Element<'a, Message> {
     let path = entry.path.clone();
     let path2 = entry.path.clone();
-    let bg = if selected { SELECTED_BG() } else { BG() };
+    let path3 = entry.path.clone();
+    let path4 = entry.path.clone();
+    let path5 = entry.path.clone();
+    let bg = if is_drop_target { SELECTED_BG() } else if selected { SELECTED_BG() } else { BG() };
     let size_str = if entry.is_dir { "-".to_string() } else { format_size(entry.size) };
     let mime_short = if entry.is_dir {
         "Folder".to_string()
@@ -197,7 +224,6 @@ fn list_row<'a>(entry: &'a FileEntry, selected: bool, suppress_hover: bool) -> E
         .spacing(8)
         .align_y(iced::Alignment::Center)
     )
-    .on_press(Message::EntryClicked(path))
     .width(Length::Fill)
     .style(move |_, status| button::Style {
         background: Some(Background::Color(match status {
@@ -206,12 +232,18 @@ fn list_row<'a>(entry: &'a FileEntry, selected: bool, suppress_hover: bool) -> E
         })),
         text_color: TEXT(),
         border: Border {
-            color: if selected { ACCENT() } else { Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } },
-            width: if selected { 1.0 } else { 0.0 },
+            color: if is_drop_target || selected { ACCENT() } else { Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 } },
+            width: if is_drop_target { 2.0 } else if selected { 1.0 } else { 0.0 },
             radius: 3.0.into(),
         },
         ..Default::default()
     });
 
-    mouse_area(btn).on_right_press(Message::ContextMenuOpenEntry(path2)).into()
+    mouse_area(btn)
+        .on_press(Message::EntryPressed(path))
+        .on_release(Message::EntryReleased(path4))
+        .on_enter(Message::EntryHoverEnter(path3))
+        .on_exit(Message::EntryHoverExit(path5))
+        .on_right_press(Message::ContextMenuOpenEntry(path2))
+        .into()
 }

@@ -15,41 +15,19 @@ use crate::panes::{filelist, sidebar, toolbar};
 const SEARCH_RESULT_CAP: usize = 500;
 
 
-// ── Color palette (loaded from ~/.config/sway-power/config.json) ──────────────
+// ── Color palette (loaded from ~/.config/sway-power/config.json via og-config/og-theme) ──
+const APP_TINT_SEED: &str = "og-files";
+
 pub fn load_theme_colors() -> (Color, Color, Color, Color, Color, Color, Color) {
-    fn hex(h: &str) -> Color {
-        let h = h.trim_start_matches('#');
-        if h.len() < 6 { return Color::BLACK; }
-        let r = u8::from_str_radix(&h[0..2], 16).unwrap_or(128);
-        let g = u8::from_str_radix(&h[2..4], 16).unwrap_or(128);
-        let b = u8::from_str_radix(&h[4..6], 16).unwrap_or(128);
-        Color::from_rgb8(r, g, b)
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    let path = format!("{}/.config/sway-power/config.json", home);
-    let json: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::Value::Null);
-    let s = |k: &str, d: &str| json[k].as_str().unwrap_or(d).to_string();
-    let bar_bg  = hex(&s("bar_bg",  "#1a1a2e"));
-    let sec_bg  = hex(&s("sec_bg",  "#2a2535"));
-    let text    = hex(&s("bar_text","#e0e0e0"));
-    let accent  = hex(&s("accent",  "#ff7800"));
-    let muted   = Color { a: 0.55, ..text };
-    let surface = Color {
-        r: text.r * 0.08 + bar_bg.r * 0.92,
-        g: text.g * 0.08 + bar_bg.g * 0.92,
-        b: text.b * 0.08 + bar_bg.b * 0.92,
-        a: 1.0,
-    };
+    let cfg = og_config::Config::load();
+    let c = og_theme::AppColors::from_config(&cfg, APP_TINT_SEED);
     let selected = Color {
-        r: accent.r * 0.25 + bar_bg.r * 0.75,
-        g: accent.g * 0.25 + bar_bg.g * 0.75,
-        b: accent.b * 0.25 + bar_bg.b * 0.75,
+        r: c.accent.r * 0.25 + c.bar_bg.r * 0.75,
+        g: c.accent.g * 0.25 + c.bar_bg.g * 0.75,
+        b: c.accent.b * 0.25 + c.bar_bg.b * 0.75,
         a: 1.0,
     };
-    (bar_bg, sec_bg, text, accent, muted, selected, surface)
+    (c.bar_bg, c.sec_bg, c.text, c.accent, c.dim_text, selected, c.surface)
 }
 
 static THEME: std::sync::LazyLock<std::sync::RwLock<(Color,Color,Color,Color,Color,Color,Color)>> =
@@ -57,7 +35,7 @@ static THEME: std::sync::LazyLock<std::sync::RwLock<(Color,Color,Color,Color,Col
 
 pub const fn init_colors() {}  // no-op; LazyLock inits on first access
 
-/// Re-reads the shared theme config and swaps it in — lets settings-manager's
+/// Re-reads the shared theme config and swaps it in — lets og-settings'
 /// Apply & Save take effect here without closing/reopening this window.
 /// Every `BG()`/`TEXT()`/etc. call site is unaffected since they already go
 /// through a function call, not a direct field read.
@@ -129,6 +107,9 @@ pub enum PaneDrag {
 const SIDEBAR_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 140.0..=400.0;
 const PREVIEW_WIDTH_RANGE: std::ops::RangeInclusive<f32> = 180.0..=500.0;
 const DIVIDER_WIDTH: f32 = 5.0;
+/// Pixels the cursor must move (from where the mouse went down) before a
+/// press counts as a file drag instead of a click.
+const FILE_DRAG_THRESHOLD: f32 = 6.0;
 
 // ── Messages ───────────────────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
@@ -139,8 +120,11 @@ pub enum Message {
     NavigateForward,
     NavigateUp,
     NavigateHome,
-    EntryClicked(PathBuf),
     EntryDoubleClicked(PathBuf),
+    EntryPressed(PathBuf),
+    EntryReleased(PathBuf),
+    EntryHoverEnter(PathBuf),
+    EntryHoverExit(PathBuf),
     SelectAll,
     SearchChanged(String),
     SearchSubmit,
@@ -192,6 +176,8 @@ pub enum Message {
     PaneDragEnd,
     WindowResized(Size),
     Noop,
+    WindowIdReady(Option<iced::window::Id>),
+    WaylandDisplayReady(Option<usize>),
 }
 
 // ── App ────────────────────────────────────────────────────────────────────────
@@ -234,6 +220,19 @@ pub struct App {
     pub pane_drag: Option<PaneDrag>,
     pub drag_preview_x: f32,
     pub window_size: Size,
+    /// Set on press, cleared on the matching release — a click that never
+    /// crosses `FILE_DRAG_THRESHOLD` resolves as a normal
+    /// select/navigate; one that does gets promoted to `file_drag`.
+    pub press_origin: Option<(PathBuf, Point)>,
+    /// Files/folders currently being dragged to another folder, once the
+    /// press has moved far enough to count as a drag rather than a click.
+    pub file_drag: Option<Vec<PathBuf>>,
+    /// Folder row currently under the cursor while `file_drag` is active —
+    /// purely for the drop-target highlight.
+    pub drop_hover: Option<PathBuf>,
+    /// `None` until the real Wayland display handle round-trip finishes;
+    /// `Some` once the cross-app drag-out worker thread is up and ready.
+    pub drag_tx: Option<calloop::channel::Sender<og_wayland::DragRequest>>,
 }
 
 impl App {
@@ -285,8 +284,12 @@ impl App {
                 pane_drag: None,
                 drag_preview_x: 0.0,
                 window_size: Size::new(1200.0, 800.0),
+                press_origin: None,
+                file_drag: None,
+                drop_hover: None,
+                drag_tx: None,
             },
-            Task::none(),
+            iced::window::get_latest().map(Message::WindowIdReady),
         )
     }
 
@@ -410,6 +413,60 @@ impl App {
         )
     }
 
+    /// A press+release that never crossed the drag threshold — same
+    /// select/navigate behavior this app always had on a single click.
+    fn handle_entry_click(&mut self, path: PathBuf) -> Task<Message> {
+        let entry = self.displayed_entries().iter().find(|e| e.path == path).cloned();
+        if let Some(e) = entry {
+            if e.is_dir {
+                self.navigate_to(path);
+            } else {
+                if self.selected.contains(&path) {
+                    self.selected.remove(&path);
+                } else {
+                    self.selected.clear();
+                    self.selected.insert(path.clone());
+                }
+                self.status_message = format!(
+                    "{} items  |  {} selected",
+                    self.displayed_entries().len(),
+                    self.selected.len()
+                );
+                return self.update_preview();
+            }
+        }
+        Task::none()
+    }
+
+    /// Drag-and-drop of `paths` onto `target_dir` — a plain move, same as
+    /// cut+paste into that folder.
+    fn move_entries_into(&mut self, paths: &[PathBuf], target_dir: &std::path::Path) {
+        let mut moved = 0;
+        for src in paths {
+            // Dropping a folder onto itself or one of its own descendants
+            // would either no-op or corrupt it — skip silently rather than
+            // erroring on every ordinary drag that starts inside the
+            // target (e.g. dragging within the same open folder).
+            if target_dir.starts_with(src) {
+                continue;
+            }
+            let Some(name) = src.file_name() else { continue };
+            let dst = target_dir.join(name);
+            if dst == *src {
+                continue;
+            }
+            match filesystem::move_file(src, &dst) {
+                Ok(_) => moved += 1,
+                Err(e) => self.status_message = format!("Error: {}", e),
+            }
+        }
+        if moved > 0 {
+            self.status_message = format!("Moved {moved} item(s)");
+            self.selected.clear();
+            self.refresh();
+        }
+    }
+
     pub fn update(&mut self, msg: Message) -> Task<Message> {
         match msg {
             Message::CheckThemeReload => {
@@ -440,25 +497,27 @@ impl App {
             Message::NavigateHome => {
                 self.navigate_to(home_dir());
             }
-            Message::EntryClicked(path) => {
-                let entry = self.displayed_entries().iter().find(|e| e.path == path).cloned();
-                if let Some(e) = entry {
-                    if e.is_dir {
-                        self.navigate_to(path);
-                    } else {
-                        if self.selected.contains(&path) {
-                            self.selected.remove(&path);
-                        } else {
-                            self.selected.clear();
-                            self.selected.insert(path.clone());
-                        }
-                        self.status_message = format!(
-                            "{} items  |  {} selected",
-                            self.displayed_entries().len(),
-                            self.selected.len()
-                        );
-                        return self.update_preview();
+            Message::EntryPressed(path) => {
+                self.press_origin = Some((path, self.cursor_pos));
+            }
+            Message::EntryReleased(released_path) => {
+                let Some((pressed_path, _)) = self.press_origin.take() else { return Task::none() };
+                if let Some(dragged) = self.file_drag.take() {
+                    self.drop_hover = None;
+                    let target_is_dir = self.displayed_entries().iter().any(|e| e.path == released_path && e.is_dir);
+                    if target_is_dir && !dragged.contains(&released_path) {
+                        self.move_entries_into(&dragged, &released_path);
                     }
+                } else {
+                    return self.handle_entry_click(pressed_path);
+                }
+            }
+            Message::EntryHoverEnter(path) => {
+                self.drop_hover = Some(path);
+            }
+            Message::EntryHoverExit(path) => {
+                if self.drop_hover.as_ref() == Some(&path) {
+                    self.drop_hover = None;
                 }
             }
             Message::EntryDoubleClicked(path) => {
@@ -919,6 +978,31 @@ impl App {
                 if self.pane_drag.is_some() {
                     self.drag_preview_x = pos.x;
                 }
+                // A held-down press only becomes a file drag once the
+                // cursor has actually moved a few pixels — otherwise every
+                // ordinary click (press+release near-instantly, same spot)
+                // would count as a drag of the pressed item onto itself.
+                if self.file_drag.is_none() {
+                    if let Some((pressed_path, press_pos)) = &self.press_origin {
+                        let dx = pos.x - press_pos.x;
+                        let dy = pos.y - press_pos.y;
+                        if dx * dx + dy * dy > FILE_DRAG_THRESHOLD * FILE_DRAG_THRESHOLD {
+                            let dragged: Vec<PathBuf> = if self.selected.contains(pressed_path) {
+                                self.selected.iter().cloned().collect()
+                            } else {
+                                vec![pressed_path.clone()]
+                            };
+                            // Also kick off a real OS-level drag, so
+                            // dropping outside this window (e.g. onto a
+                            // browser's upload zone) works too, not just
+                            // dropping onto a folder row in here.
+                            if let Some(tx) = &self.drag_tx {
+                                let _ = tx.send(og_wayland::DragRequest { paths: dragged.clone() });
+                            }
+                            self.file_drag = Some(dragged);
+                        }
+                    }
+                }
             }
             Message::PaneDragStart(target) => {
                 self.pane_drag = Some(target);
@@ -940,11 +1024,29 @@ impl App {
                         }
                     }
                 }
+                // Fallback cleanup for a release over empty space (no
+                // row's `on_release` fired to consume it there).
+                self.press_origin = None;
+                self.file_drag = None;
+                self.drop_hover = None;
             }
             Message::WindowResized(size) => {
                 self.window_size = size;
             }
             Message::Noop => {}
+            Message::WindowIdReady(Some(id)) => {
+                return iced::window::run_with_handle(id, |handle| {
+                    og_wayland::display_ptr_from_window_handle(handle)
+                })
+                .map(Message::WaylandDisplayReady);
+            }
+            Message::WindowIdReady(None) => {}
+            Message::WaylandDisplayReady(Some(display_ptr)) => {
+                self.drag_tx = Some(og_wayland::spawn(display_ptr));
+            }
+            Message::WaylandDisplayReady(None) => {
+                self.status_message = "Cross-app drag-out unavailable (non-Wayland session?)".to_string();
+            }
         }
         Task::none()
     }
@@ -962,10 +1064,11 @@ impl App {
 
         let sidebar = sidebar::view(&self.current_path, &self.devices, &self.network_drives, &self.recent, &self.bookmarks, self.sidebar_width);
 
-        let mut file_area_width = self.window_size.width - self.sidebar_width - DIVIDER_WIDTH;
-        if self.preview.is_some() {
-            file_area_width -= self.preview_width + DIVIDER_WIDTH;
-        }
+        // Preview pane's column is always reserved (even with nothing
+        // selected) — toggling it in and out used to shift/resize every
+        // other pane each time you clicked a file, which read as the whole
+        // window "rearranging itself".
+        let file_area_width = self.window_size.width - self.sidebar_width - DIVIDER_WIDTH - self.preview_width - DIVIDER_WIDTH;
         let overlay_open = self.context_menu.is_some() || self.open_with.is_some() || self.confirm.is_some();
         let file_area = filelist::view(
             self.displayed_entries(),
@@ -975,6 +1078,7 @@ impl App {
             &self.sort_by,
             self.sort_asc,
             overlay_open,
+            if self.file_drag.is_some() { self.drop_hover.as_ref() } else { None },
         );
 
         let path_str = self.current_path.to_string_lossy().to_string();
@@ -1001,10 +1105,8 @@ impl App {
             pane_divider(PaneDrag::Sidebar),
             file_area,
         ];
-        if let Some(details) = &self.preview {
-            main_children.push(pane_divider(PaneDrag::Preview));
-            main_children.push(self.preview_panel(details));
-        }
+        main_children.push(pane_divider(PaneDrag::Preview));
+        main_children.push(self.preview_panel(self.preview.as_ref()));
         let main_content = row(main_children).width(Length::Fill).height(Length::Fill);
 
         let base = column![toolbar, main_content, status_bar]
@@ -1100,8 +1202,24 @@ impl App {
         stack![base, overlay].into()
     }
 
-    fn preview_panel<'a>(&'a self, d: &'a FileDetails) -> Element<'a, Message> {
+    fn preview_panel<'a>(&'a self, details: Option<&'a FileDetails>) -> Element<'a, Message> {
         const ICON_FONT: iced::Font = iced::Font::with_name("Symbols Nerd Font");
+
+        let Some(d) = details else {
+            return container(
+                container(text("No selection").size(13).style(move |_| text::Style { color: Some(MUTED()) }))
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+            )
+            .width(self.preview_width)
+            .height(Length::Fill)
+            .style(|_| container::Style {
+                background: Some(Background::Color(SEC_BG())),
+                ..Default::default()
+            })
+            .into();
+        };
+
         let icon = filesystem::icon_for(&d.mime_type, d.is_dir);
         let is_media = filesystem::is_previewable_image(&d.mime_type) || filesystem::is_video(&d.mime_type);
 
@@ -1434,7 +1552,7 @@ impl App {
     pub fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             iced::event::listen_with(track_events),
-            // Cheap poll so settings-manager's Apply & Save takes effect
+            // Cheap poll so og-settings' Apply & Save takes effect
             // here live, without needing to close/reopen this window.
             iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::CheckThemeReload),
         ])
